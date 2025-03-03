@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 	_ "math/rand"
 	"sync"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -73,7 +74,9 @@ type Raft struct {
 	//timer for heart beat
 	heartbeatTimer *time.Timer
 	//channel to send apply message to service
-	applyCh chan ApplyMsg
+	applyCh        chan ApplyMsg
+	applyCond      *sync.Cond
+	replicatedCond []*sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -195,8 +198,6 @@ func (rf *Raft) ChangeState(state NodeState) {
 
 }
 
-
-
 // start a Election
 func (rf *Raft) StartElection() {
 	//vote for self
@@ -246,7 +247,7 @@ func (rf *Raft) BroadcastHeartbeat() {
 				rf.mu.RUnlock()
 				return
 			}
-			args := rf.genAppendEntriesArgs()
+			args := rf.genAppendEntriesArgs(rf.nextIndex[peer] - 1)
 			rf.mu.RUnlock()
 			reply := new(AppendEntriesReply)
 			//send heartbeat sync log
@@ -289,6 +290,121 @@ func (rf *Raft) ticker() {
 	// Your code here (3A)
 }
 
+func (rf *Raft)isLogMatched(index int, term int) bool{
+	return index <= rf.getLastLog().Index && term == rf.logs[index-rf.getFirstLog().Index].Term
+}
+
+func (rf *Raft) advanceCommitIndexForLeader() {
+	n := len(rf.matchIndex)
+	sortMatchIndex := make([]int, n)
+	copy(sortMatchIndex, rf.matchIndex)
+	sort.Ints(sortMatchIndex)
+	
+	newCommitIndex := sortMatchIndex[n - (n/2 + 1)]
+	if newCommitIndex > rf.commitIndex{
+		if rf.isLogMatched(newCommitIndex, rf.currentTerm){
+			DPrintf("{Node %v} advances commitIndex from %v to %v in term %v",rf.me, rf.commitIndex,newCommitIndex,rf.currentTerm)
+			rf.commitIndex = newCommitIndex
+			rf.applyCond.Signal()
+		}
+	}
+}
+
+
+func (rf *Raft) needReplicating(peer int) bool {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	//检查条目是否在小于leader
+	return rf.state == Leader && rf.matchIndex[peer] < rf.getLastLog().Index
+}
+
+func (rf *Raft) replicateOnceRound(peer int) {
+	rf.mu.Lock()
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	prevLogIndex := rf.nextIndex[peer] - 1
+	args := rf.genAppendEntriesArgs(prevLogIndex)
+	rf.mu.Unlock()
+
+	reply := new(AppendEntriesReply)
+	if rf.sendAppendEntries(peer, args, reply) {
+		rf.mu.Lock()
+		if args.Term == rf.currentTerm && rf.state == Leader {
+			if !reply.Success {
+				if reply.Term > rf.currentTerm {
+					//说明当前节点不再是Leader
+					rf.ChangeState(Follower)
+					rf.currentTerm, rf.votedFor = reply.Term, -1
+				}else if reply.Term == rf.currentTerm{
+					//decrease nextIndex and retry
+					rf.nextIndex[peer] =  reply.ConflictIndex
+					if reply.ConflictTerm != -1 {
+						firstLogIndex := rf.getFirstLog().Index
+						index := args.PrevLogIndex - 1
+						for ; index >= firstLogIndex; index-- {
+							if rf.logs[index].Term == reply.ConflictTerm{
+								rf.nextIndex[peer] = index
+								break
+							}
+						}
+					}
+				}
+			}else {
+				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+				// advance commitIndex if possible
+				rf.advanceCommitIndexForLeader()
+			}
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) replicator(peer int) {
+	rf.replicatedCond[peer].L.Lock()
+	defer rf.replicatedCond[peer].L.Unlock()
+
+	for rf.killed() == false {
+		for !rf.needReplicating(peer) {
+			rf.replicatedCond[peer].Wait()
+		}
+		//向peer发送日志条目
+		rf.replicateOnceRound(peer)
+	}
+}
+
+func (rf *Raft) applier(){
+	for rf.killed() == false {
+		rf.mu.Lock()
+		//检查commitIndex
+		for rf.commitIndex <= rf.lastApplied{
+			rf.applyCond.Wait()
+		}
+
+		//添加日志到状态机
+		firstLogIndex, commitIndex, lastApplied :=  rf.getFirstLog().Index, rf.commitIndex, rf.lastApplied
+		entries := make([]LogEntry, commitIndex - lastApplied)
+		copy(entries, rf.logs[lastApplied-firstLogIndex + 1 :commitIndex - firstLogIndex + 1]) 
+		rf.mu.Unlock()
+
+		//发送提交信息
+		for _, entry := range entries{
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+		}
+		rf.mu.Lock()
+		DPrintf("{Node %v} applies log entries form index %v to %v in term %v",rf.me, lastApplied+1,commitIndex,rf.currentTerm)
+		rf.lastApplied = commitIndex
+		rf.applyCond.Signal()
+		rf.mu.Unlock()
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -317,15 +433,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:  time.NewTimer(RandomElectionTimeout()),
 		heartbeatTimer: time.NewTimer(StableHeartbeatTimeout()),
 		applyCh:        applyCh,
+		replicatedCond: make([]*sync.Cond, len(peers)),
 	}
 
 	// Your initialization code here (3A, 3B, 3C).
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	//使用mu保护applyCond,避免并发
+	rf.applyCond = sync.NewCond(&rf.mu)
+	//初始化nextIndex和matchIndex并且启动复制器协程
+	for peer := range rf.peers {
+		rf.matchIndex[peer], rf.nextIndex[peer] = 0, rf.getLastLog().Index+1
+		if peer == rf.me {
+			rf.replicatedCond[peer] = sync.NewCond(&sync.Mutex{})
+			//开启复制器协程发送日志条目
+			go rf.replicator(peer)
+		}
+	}
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	//启动提交协程提交日志到状态机器
+	go rf.applier()
 
 	return rf
 }

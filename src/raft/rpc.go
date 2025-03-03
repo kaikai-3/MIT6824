@@ -20,6 +20,8 @@ type RequestVoteReply struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	ConflictIndex int
+	ConflictTerm int
 }
 //
 type AppendEntriesArgs struct {
@@ -32,10 +34,18 @@ type AppendEntriesArgs struct {
 }
 
 // generate RequestVote args
-func (rf *Raft)genAppendEntriesArgs() *AppendEntriesArgs{
+func (rf *Raft)genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs{
+	firstLogIndex := rf.getFirstLog().Index
+	entries := make([]LogEntry, len(rf.logs[prevLogIndex -firstLogIndex+ 1 :]))
+	copy(entries, rf.logs[prevLogIndex - firstLogIndex + 1:])
+
 	args := &AppendEntriesArgs{
 		Term: rf.currentTerm,
 		LeaderId: rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm: rf.logs[prevLogIndex - firstLogIndex].Term,
+		LeaderCommit: rf.commitIndex,
+		Entries: entries,
 	}
 	return args
 }
