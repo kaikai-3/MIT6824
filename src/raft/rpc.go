@@ -20,6 +20,8 @@ type RequestVoteReply struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	ConflictIndex int
+	ConflictTerm int
 }
 //
 type AppendEntriesArgs struct {
@@ -32,10 +34,18 @@ type AppendEntriesArgs struct {
 }
 
 // generate RequestVote args
-func (rf *Raft)genAppendEntriesArgs() *AppendEntriesArgs{
+func (rf *Raft)genAppendEntriesArgs(prevLogIndex int) *AppendEntriesArgs{
+	firstLogIndex := rf.getFirstLog().Index
+	entries := make([]LogEntry, len(rf.logs[prevLogIndex -firstLogIndex+ 1 :]))
+	copy(entries, rf.logs[prevLogIndex - firstLogIndex + 1:])
+
 	args := &AppendEntriesArgs{
 		Term: rf.currentTerm,
 		LeaderId: rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm: rf.logs[prevLogIndex - firstLogIndex].Term,
+		LeaderCommit: rf.commitIndex,
+		Entries: entries,
 	}
 	return args
 }
@@ -72,6 +82,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.ChangeState(Follower)
 		rf.currentTerm, rf.votedFor = args.Term, -1
 	}
+	//如果candidate的日志已经过时，拒绝投票
+	if !rf.isLogUpToDate(args.LastLogIndex, args.LastLogTerm){
+		reply.Term, reply.VoteGranted = rf.currentTerm, false
+		return
+	}
+
 	rf.votedFor = args.CandidateId
 	rf.electionTimer.Reset(RandomElectionTimeout())
 	reply.Term, reply.VoteGranted =rf.currentTerm, true	
@@ -126,8 +142,52 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm , rf.votedFor = args.Term,-1
 	}
 
+	//may this node have a older state,and receive a heigher term ,so change state to follower
 	rf.ChangeState(Follower)
 	rf.electionTimer.Reset(RandomElectionTimeout())
+
+	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm(§5.3)
+	if args.PrevLogIndex < rf.getFirstLog().Index {
+		reply.Term, reply.Success = rf.currentTerm, false
+		return
+	}
+
+	// 检查日志是否匹配， 如果不匹配则返回这个conflict信息
+	if !rf.isLogMatched(args.PrevLogIndex, args.PrevLogTerm) {
+		reply.Term, reply.Success = rf.currentTerm, false
+		lastLogIndex := rf.getLastLog().Index
+		// find the first index of the conflicting term
+		if lastLogIndex < args.PrevLogIndex {
+			// the last log index is smaller than the prevLogIndex, then the conflict index is the last log index
+			reply.ConflictIndex, reply.ConflictTerm = lastLogIndex+1, -1
+		} else {
+			firstLogIndex := rf.getFirstLog().Index
+			// find the first index of the conflicting term
+			index := args.PrevLogIndex
+			for index >= firstLogIndex && rf.logs[index-firstLogIndex].Term == args.PrevLogTerm {
+				index--
+			}
+			reply.ConflictIndex, reply.ConflictTerm = index+1, args.PrevLogTerm
+		}
+		return
+	}
+
+	firstLogIndex := rf.getFirstLog().Index
+	for index , entry := range args.Entries{
+		if entry.Index - firstLogIndex >= len(rf.logs) || rf.logs[entry.Index - firstLogIndex].Term != entry.Term{
+			rf.logs = append(rf.logs[:entry.Index - firstLogIndex], args.Entries[index:]...)
+			break
+		}
+	}
+
+	// 如果Lead提交的日志比当前的commitIndex大， 更新commitIndex
+	newCommitIndex := Min(args.LeaderCommit, rf.getLastLog().Index)
+	if newCommitIndex > rf.commitIndex{
+		DPrintf(`{node %v} advances commitIndex from %v to %v with leaderCommit %v in t
+		erm %v`, rf.me , rf.commitIndex,newCommitIndex,args.LeaderCommit, rf.currentTerm)
+		rf.commitIndex = newCommitIndex
+		rf.applyCond.Signal()
+	}
 	reply.Term, reply.Success = rf.currentTerm, true
 }
 
