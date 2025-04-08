@@ -19,13 +19,11 @@ package raft
 
 import (
 	//	"bytes"
-	_ "math/rand"
-	"sort"
 	"sync"
 	"sync/atomic"
+	"sort"
 	"time"
 
-	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -38,45 +36,61 @@ import (
 // in part 3D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
-
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
+	mu sync.RWMutex // Lock to protect shared access to this peer's state
+	// 目标服务器索引
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (3A, 3B, 3C).
-	//Persistent state on all servers
-	currentTerm int
-	votedFor    int
-	//log entries each entry contains command for state machine, and
-	// term when rntry was received by leader(first index is 1)
-	logs []LogEntry
-	//Volatile state on all servers
-	//commitIndex is the index of highest log entry known to be commited
-	commitIndex int
-	//index of highest log entry applied to state machine
-	lastApplied int
+	// Persistent state on all servers(Updated on stable storage before responding to RPCs)
+	currentTerm int // latest term server has seen(initialized to 0 on first boot, increases monotonically)
+	//当前节点是否已经投票
+	votedFor int // candidateId that received vote in current term(or null if none)
+	// 日志条目列表
+	logs []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader(first index is 1)
 
-	//Volatile state on leaders
-	//for each server,index of the next log entry to send that server
-	nextIndex []int
-	//for each setver,index of highest log entry known to be replicated on server
-	matchIndex []int
+	// Volatile state on all servers
+	commitIndex int // index of highest log entry known to be committed(initialized to 0, increases monotonically)
+	lastApplied int // index of highest log entry applied to state machine(initialized to 0, increases monotonically)
+	//下一个将要同步的日志索引
+	// Volatile state on leaders(Reinitialized after election)
+	nextIndex  []int // for each server, index of the next log entry to send to that server(initialized to leader last log index + 1)
+	matchIndex []int // for each server, index of highest log entry known to be replicated on server(initialized to 0, increases monotonically)
 
-	//other properties
-	//current state of the server
-	state NodeState
-	//timer for election timeout
-	electionTimer *time.Timer
-	//timer for heart beat
-	heartbeatTimer *time.Timer
-	//channel to send apply message to service
-	applyCh        chan ApplyMsg
-	applyCond      *sync.Cond
+	// other properties
+	state          NodeState     // current state of the server
+	electionTimer  *time.Timer   // timer for election timeout
+	heartbeatTimer *time.Timer   // timer for heartbeat
+	applyCh        chan ApplyMsg // channel to send apply message to service
+	//通知一个goroutine,确认同步状态
+	applyCond *sync.Cond
+	//通知多个goroutine,确认同步状态
 	replicatorCond []*sync.Cond
+}
+
+func (rf *Raft) ChangeState(state NodeState) {
+	if rf.state == state {
+		return
+	}
+	DPrintf("{Node %v} changes state from %v to %v", rf.me, rf.state, state)
+	rf.state = state
+	switch state {
+	case Follower:
+		// 保持一致性的措施
+		// 重新设置选举时间，引入随即防止多个节点同时发起选举
+		// Leader超时会变成candidate,然后随即发起选举
+		rf.electionTimer.Reset(RandomElectionTimeout())
+		rf.heartbeatTimer.Stop() // stop heartbeat
+	case Candidate:
+	case Leader:
+		//变成leafer后不用再选举，
+		// 定期发送心跳给follow保持联系避免产生不必要的选举
+		rf.electionTimer.Stop() // stop election
+		rf.heartbeatTimer.Reset(StableHeartbeatTimeout())
+	}
 }
 
 // return currentTerm and whether this server
@@ -95,6 +109,7 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
+
 	// Your code here (3C).
 	// Example:
 	// w := new(bytes.Buffer)
@@ -149,31 +164,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	index, term, isLeader := -1, -1, false
 	if rf.state != Leader {
-		return index, term, isLeader
+		return -1, -1, false
 	}
-	isLeader = true
-	//第一次添加日志
-	index, term = rf.getLastLog().Index+1, rf.currentTerm
+	newLogIndex := rf.getLastLog().Index + 1
 	rf.logs = append(rf.logs, LogEntry{
-		Term:    term,
-		Index:   index,
+		Term:	rf.currentTerm,
 		Command: command,
+		Index: newLogIndex,
 	})
-	rf.matchIndex[rf.me], rf.nextIndex[rf.me] = index, index+1
-	DPrintf("node{%v} starts agreement on a new log entry with commond %v in term %v", rf.me, command, rf.currentTerm)
+	//每一个节点初始化自己的第一个并默认同一
+	rf.matchIndex[rf.me] , rf.nextIndex[rf.me]= newLogIndex, newLogIndex + 1
+	DPrintf("{Node %v} starts agreement on a new log entry with command %v in term %v", rf.me, command, rf.currentTerm)
+	//然后广播所有raft节点统一
 	rf.BroadcastHeartbeat(false)
-	return index, term, isLeader
+	return newLogIndex, rf.currentTerm, true
 }
-
-// func (rf *Raft) BroadcastReplicate() {
-// 	for peer := range rf.peers {
-// 		if peer != rf.me {
-// 			rf.replicatedCond[peer].Signal()
-// 		}
-// 	}
-// }
 
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
@@ -194,45 +200,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) isLogUpToDate(index, term int) bool {
-	lastLog := rf.getLastLog()
-	return term > lastLog.Term || (term == lastLog.Term && index > lastLog.Index)
-}
-
-func (rf *Raft) isLogMatched(index int, term int) bool {
-	return index <= rf.getLastLog().Index && term == rf.logs[index-rf.getFirstLog().Index].Term
-}
-
-func (rf *Raft) ChangeState(state NodeState) {
-	if rf.state == state {
-		return
-	}
-	DPrintf("{Node %v} changes state form %v to %v", rf.me, rf.state, state)
-	rf.state = state
-
-	switch state {
-	case Follower:
-		//after state change to follower,we should to stop send heartbeat
-		// and start keep an election timer
-		rf.electionTimer.Reset(RandomElectionTimeout())
-		rf.heartbeatTimer.Stop()
-	case Candidate:
-	case Leader:
-		//after be a leader ,then should stop election timer
-		//and start a heartbeat timer to keep leader state
-		rf.electionTimer.Stop()
-		rf.heartbeatTimer.Reset(StableHeartbeatTimeout())
-	}
-}
-
-// start a Election
 func (rf *Raft) StartElection() {
-	//vote for self
 	rf.votedFor = rf.me
 	args := rf.genRequestVoteArgs()
 	grantedVotes := 1
 	DPrintf("{Node %v} starts election with RequestVoteArgs %v", rf.me, args)
-
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -242,7 +214,7 @@ func (rf *Raft) StartElection() {
 			if rf.sendRequestVote(peer, args, reply) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				DPrintf("{Node %v} receives RequestVoteReply %v form {Node %v} after sending RequestVoteArgs %v", rf.me, reply, peer, args)
+				DPrintf("{Node %v} receives RequestVoteReply %v from {Node %v} after sending RequestVoteArgs %v", rf.me, reply, peer, args)
 				if args.Term == rf.currentTerm && rf.state == Candidate {
 					if reply.VoteGranted {
 						grantedVotes += 1
@@ -251,6 +223,7 @@ func (rf *Raft) StartElection() {
 							rf.ChangeState(Leader)
 							rf.BroadcastHeartbeat(true)
 						}
+						//受到的任期已经大于当前的任期，表明有leader当选了
 					} else if reply.Term > rf.currentTerm {
 						rf.ChangeState(Follower)
 						rf.currentTerm, rf.votedFor = reply.Term, -1
@@ -261,15 +234,44 @@ func (rf *Raft) StartElection() {
 	}
 }
 
-func (rf *Raft) BroadcastHeartbeat(isHeartbeat bool) {
+//
+func (rf *Raft) isLogUpToDate(index, term int) bool {
+	lastLog := rf.getLastLog()
+	return term > lastLog.Term || (term == lastLog.Term && index >= lastLog.Index)
+}
+
+func (rf *Raft) isLogMatched(index, term int) bool {
+	return index <= rf.getLastLog().Index && term == rf.logs[index - rf.getFirstLog().Index].Term
+}
+
+//超过半数就commit， 控制每个Raft节点同步日志index
+func (rf *Raft) advanceCommitIndexForLeader(){
+	//n表示服务器数量
+	n := len(rf.matchIndex)
+	//对每个Raft节点同意的索引值进行排序
+	sortMatchIndex := make([]int, n)
+	copy(sortMatchIndex, rf.matchIndex)
+	sort.Ints(sortMatchIndex)
+	//对每个Raft节点同意的
+	newCommitIndex := sortMatchIndex[n -(n/2 + 1)]
+	//执行同步，唤醒分布式锁
+	if newCommitIndex > rf.commitIndex {
+		if rf.isLogMatched(newCommitIndex, rf.currentTerm){
+			DPrintf("{Node %v} advances commitIndex from %v to %v in term %v", rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm)
+			rf.commitIndex = newCommitIndex
+			rf.applyCond.Signal()
+		}
+	}
+}
+
+func (rf *Raft) BroadcastHeartbeat(isHeartBeat bool) {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
-		if isHeartbeat {
+		if isHeartBeat {
 			go rf.replicateOnceRound(peer)
-		} else {
-			//让所以节点复制日志
+		}else {
 			rf.replicatorCond[peer].Signal()
 		}
 	}
@@ -278,7 +280,7 @@ func (rf *Raft) BroadcastHeartbeat(isHeartbeat bool) {
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 		select {
-		//case election timeout,change state to candidate and start election
+		// reset会重新向管道里面写入东西吗
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
 			rf.ChangeState(Candidate)
@@ -297,66 +299,56 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) advanceCommitIndexForLeader() {
-	n := len(rf.matchIndex)
-	sortMatchIndex := make([]int, n)
-	copy(sortMatchIndex, rf.matchIndex)
-	sort.Ints(sortMatchIndex)
-
-	newCommitIndex := sortMatchIndex[n-(n/2+1)]
-	if newCommitIndex > rf.commitIndex {
-		if rf.isLogMatched(newCommitIndex, rf.currentTerm) {
-			DPrintf("{Node %v} advances commitIndex from %v to %v in term %v", rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm)
-			rf.commitIndex = newCommitIndex
-			rf.applyCond.Signal()
-		}
-	}
-}
-
+// 判断是否需要复制
 func (rf *Raft) needReplicating(peer int) bool {
+	//加读锁
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
-	//检查条目是否在小于leader
+	//检查leader节点的同步日志是否落后于最后一条日志
 	return rf.state == Leader && rf.matchIndex[peer] < rf.getLastLog().Index
 }
 
 func (rf *Raft) replicateOnceRound(peer int) {
+	//加读锁
+	//这里的rf节点是leader， peer中的需要复制的节点
 	rf.mu.RLock()
 	if rf.state != Leader {
 		rf.mu.RUnlock()
 		return
 	}
+	//leader节点维护每一个raft节点的日志条目
 	prevLogIndex := rf.nextIndex[peer] - 1
 	args := rf.genAppendEntriesArgs(prevLogIndex)
 	rf.mu.RUnlock()
-
 	reply := new(AppendEntriesReply)
-	if rf.sendAppendEntries(peer, args, reply) {
+	//发送心跳同步日志
+	if(rf.sendAppendEntries(peer,args,reply)){
 		rf.mu.Lock()
 		if args.Term == rf.currentTerm && rf.state == Leader {
 			if !reply.Success {
+				//leader节点收到reply后发现Term已经落后
 				if reply.Term > rf.currentTerm {
-					//说明当前节点不再是Leader
 					rf.ChangeState(Follower)
 					rf.currentTerm, rf.votedFor = reply.Term, -1
-				} else if reply.Term == rf.currentTerm {
-					//decrease nextIndex and retry
+				}else if reply.Term == rf.currentTerm {
+					//直接让下一个需要同步的任期为冲突任期
 					rf.nextIndex[peer] = reply.ConflictIndex
-					if reply.ConflictTerm != -1 {
+					//表面出现了其它任期的冲突日志
+					if reply.ConflictIndex != -1{
 						firstLogIndex := rf.getFirstLog().Index
-
-						for index := args.PrevLogIndex - 1; index >= firstLogIndex; index-- {
-							if rf.logs[index-firstLogIndex].Term == reply.ConflictTerm {
+						//倒退leader的log找到第一条相同的日志
+						for index := args.PrevLogIndex-1; index > firstLogIndex; index --{
+							if rf.logs[index-firstLogIndex].Term == reply.ConflictIndex {
 								rf.nextIndex[peer] = index
-								break
+								break;
 							}
 						}
 					}
 				}
-			} else {
+			}else {
+				//如果发送的心跳reply成功，复制相应的日志，然后修改两个矩阵
 				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 				rf.nextIndex[peer] = rf.matchIndex[peer] + 1
-				// advance commitIndex if possible
 				rf.advanceCommitIndexForLeader()
 			}
 		}
@@ -364,45 +356,44 @@ func (rf *Raft) replicateOnceRound(peer int) {
 	}
 }
 
-func (rf *Raft) replicator(peer int) {
-	rf.replicatorCond[peer].L.Lock()
-	defer rf.replicatorCond[peer].L.Unlock()
-
-	for rf.killed() == false {
-		for !rf.needReplicating(peer) {
-			rf.replicatorCond[peer].Wait()
-		}
-		//向peer发送日志条目
-		rf.replicateOnceRound(peer)
-	}
-}
-
-func (rf *Raft) applier() {
+//
+func (rf *Raft) applier(){
 	for rf.killed() == false {
 		rf.mu.Lock()
-		//检查commitIndex
-		for rf.commitIndex <= rf.lastApplied {
+		for rf.commitIndex < rf.lastApplied {
+			//提交的index小于最后同步的index
 			rf.applyCond.Wait()
 		}
-
-		//添加日志到状态机
 		firstLogIndex, commitIndex, lastApplied := rf.getFirstLog().Index, rf.commitIndex, rf.lastApplied
-		entries := make([]LogEntry, commitIndex-lastApplied)
-		copy(entries, rf.logs[lastApplied-firstLogIndex+1:commitIndex-firstLogIndex+1])
+		entries := make([]LogEntry, commitIndex - lastApplied)
+		copy(entries, rf.logs[lastApplied -firstLogIndex +1 : commitIndex -firstLogIndex + 1])
 		rf.mu.Unlock()
 
-		//发送提交信息
 		for _, entry := range entries {
 			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
+				CommandValid:	true,
+				Command: entry.Command,
 				CommandIndex: entry.Index,
 			}
 		}
 		rf.mu.Lock()
-		DPrintf("{Node %v} applies log entries form index %v to %v in term %v", rf.me, lastApplied+1, commitIndex, rf.currentTerm)
+		DPrintf("{Node %v} applies log enties from %v to %v in term %v", rf.me, lastApplied + 1, commitIndex, rf.currentTerm)
 		rf.lastApplied = commitIndex
 		rf.mu.Unlock()
+	}
+}
+
+// 复制器
+func (rf *Raft) replicator(peer int) {
+	// 上分布式锁防止并发问题
+	rf.replicatorCond[peer].L.Lock()
+	defer rf.replicatorCond[peer].L.Unlock()
+	for rf.killed() == false {
+		if !rf.needReplicating(peer) {
+			//如果没有新的需要复制就等待
+			rf.replicatorCond[peer].Wait()
+		}
+		rf.replicateOnceRound(peer)
 	}
 }
 
@@ -434,27 +425,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:  time.NewTimer(RandomElectionTimeout()),
 		heartbeatTimer: time.NewTimer(StableHeartbeatTimeout()),
 		applyCh:        applyCh,
+		//用于每个goroutine之间的同步
+		//每个在满足特定条件时才进行通信/等待
 		replicatorCond: make([]*sync.Cond, len(peers)),
 	}
 
+	// Your initialization code here (3A, 3B, 3C).
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	//使用mu保护applyCond,避免并发
+	// start ticker goroutine to start elections
+	//创建互斥锁
 	rf.applyCond = sync.NewCond(&rf.mu)
-	//初始化nextIndex和matchIndex并且启动复制器协程
 	for peer := range rf.peers {
 		rf.matchIndex[peer], rf.nextIndex[peer] = 0, rf.getLastLog().Index+1
 		if peer != rf.me {
 			rf.replicatorCond[peer] = sync.NewCond(&sync.Mutex{})
-			//开启复制goroutine发送日志条目
+			//启动复制的goroutine
 			go rf.replicator(peer)
 		}
 	}
-
-	// start ticker goroutine to start elections
 	go rf.ticker()
-	//启动提交协程提交日志到状态机器
 	go rf.applier()
-
 	return rf
 }

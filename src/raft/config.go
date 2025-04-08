@@ -8,24 +8,20 @@ package raft
 // test with the original before submitting.
 //
 
-import (
-	"bytes"
-	"log"
-	"math/rand"
-	"runtime"
-	"sync"
-	"sync/atomic"
-	"testing"
-
-	"6.5840/labgob"
-	"6.5840/labrpc"
-
-	crand "crypto/rand"
-	"encoding/base64"
-	"fmt"
-	"math/big"
-	"time"
-)
+import "6.5840/labgob"
+import "6.5840/labrpc"
+import "bytes"
+import "log"
+import "sync"
+import "sync/atomic"
+import "testing"
+import "runtime"
+import "math/rand"
+import crand "crypto/rand"
+import "math/big"
+import "encoding/base64"
+import "time"
+import "fmt"
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -282,7 +278,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	cfg.endnames[i] = make([]string, cfg.n)
 	for j := 0; j < cfg.n; j++ {
 		cfg.endnames[i][j] = randstring(20)
-	}
+	}//配置新终端，模拟raft节点
 
 	// a fresh set of ClientEnds.
 	ends := make([]*labrpc.ClientEnd, cfg.n)
@@ -301,7 +297,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	// pass Make() the last persisted state.
 	if cfg.saved[i] != nil {
 		cfg.saved[i] = cfg.saved[i].Copy()
-
+		// 模拟raft 快照部分
 		snapshot := cfg.saved[i].ReadSnapshot()
 		if snapshot != nil && len(snapshot) > 0 {
 			// mimic KV server and process snapshot now.
@@ -316,7 +312,7 @@ func (cfg *config) start1(i int, applier func(int, chan ApplyMsg)) {
 	}
 
 	cfg.mu.Unlock()
-
+	// 创建Raft实例
 	applyCh := make(chan ApplyMsg)
 
 	rf := Make(ends, i, cfg.saved[i], applyCh)
@@ -435,7 +431,7 @@ func (cfg *config) checkOneLeader() int {
 		leaders := make(map[int][]int)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
-				if term, leader := cfg.rafts[i].GetState(); leader {
+ 				if term, leader := cfg.rafts[i].GetState(); leader {
 					leaders[term] = append(leaders[term], i)
 				}
 			}
