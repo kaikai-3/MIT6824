@@ -141,7 +141,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//如果当期的index起点已经大于等于raft节点中所有logs的长度，直接从这里开始复制
 		// 或者从某个日志开始Term不匹配也就找到了复制的位置
 		if entry.Index-firstLogIndex >= len(rf.logs) || rf.logs[entry.Index-firstLogIndex].Term != entry.Term {
-			rf.logs = append(rf.logs[:entry.Index-firstLogIndex], args.Entries[index:]...)
+			rf.logs = shrinkEntries(append(rf.logs[:entry.Index-firstLogIndex], args.Entries[index:]...))
 			rf.persist()
 			break
 		}
@@ -160,3 +160,64 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+
+type InstallSnapshotArgs struct {
+	Term				int
+	LeaderId 			int
+	LastIncludeIndex 	int
+	LastIncludeTerm		int
+	Data 				[]byte
+}
+
+type InstallSnapshotReply struct {
+	Term 			int
+}
+
+func (rf *Raft)genInstallSnapshotArgs() *InstallSnapshotArgs {
+	firstLog := rf.getFirstLog()
+	args := &InstallSnapshotArgs {
+		Term:				rf.currentTerm,
+		LeaderId:			rf.me,
+		LastIncludeIndex:	firstLog.Index,
+		LastIncludeTerm:	firstLog.Term,
+		Data:				rf.persister.ReadSnapshot(),
+	}
+	return args
+}
+
+//leader节点判断后决定对部分节点进行快照
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer DPrintf("{Node %v}'s state is {state %v, term %v} after processing InstallSnapshot, InstallSnapshotArgs %v and InstallSnapshotReply %v",rf.me, rf.state, rf.currentTerm, args, reply)
+	reply.Term = rf.currentTerm
+	
+	//leader判断逻辑
+	if args.Term < rf.currentTerm {
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm, rf.votedFor = args.Term, -1
+		rf.persist()
+	}
+	rf.ChangeState(Follower)
+	rf.electionTimer.Reset(RandomElectionTimeout())
+
+	if args.LastIncludeIndex <= rf.commitIndex{
+		return
+	}
+	go func(){
+		rf.applyCh <- ApplyMsg {
+			SnapshotValid:		true,
+			Snapshot:			args.Data,
+			SnapshotTerm:		args.LastIncludeTerm,
+			SnapshotIndex:		args.LastIncludeIndex,
+		}
+	}()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply)bool{
+	ok := rf.peers[server].Call("Raft.InstallSnapshot",args,reply)
+	return ok
+}
+
