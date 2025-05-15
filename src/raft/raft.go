@@ -162,7 +162,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 	snapshotIndex := rf.getFirstLog().Index
 	if index <= snapshotIndex || index > rf.getLastLog().Index {
-		DPrintf("{Node %v} rejects replacing log with snapshot %v as current snapshotIndex %v is larger in term %v",rf.me, index, snapshot,rf,rf.currentTerm)
+		DPrintf("{Node %v} rejects replacing log with snapshot %v as current snapshotIndex %v is larger in term %v",rf.me, index, snapshot,rf.currentTerm)
 		return
 	}
 	rf.logs = shrinkEntries(rf.logs[index-snapshotIndex:])
@@ -427,7 +427,7 @@ func (rf *Raft) replicateOnceRound(peer int) {
 				}
 			}
 			rf.mu.Unlock()
-			DPrintf("{Node %v} sends AppendEntriesArgs %v to {Node $v} and receives AppendEntriesReply %v", rf.me, args, peer, reply)
+			DPrintf("{Node %v} sends AppendEntriesArgs %v to {Node %v} and receives AppendEntriesReply %v", rf.me, args, peer, reply)
 		}
 	}
 }
