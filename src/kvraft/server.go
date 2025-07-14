@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -157,12 +159,57 @@ func (kv *KVServer) appler() {
 				//确保还在当前leader的任期里面
 				if currentTerm, isLeader := kv.rf.GetState(); isLeader && message.CommandTerm == currentTerm {
 					ch := kv.getNotifyCh(message.CommandIndex)
-					ch <- reply
+					ch <- reply //通知返回客户端
+				}
+				//判读是否需要快照功能
+				if kv.needSnapshot() {
+					kv.takeSnapshot(message.CommandIndex)
 				}
 				kv.mu.Unlock()
+			} else if message.SnapshotValid {
+				kv.mu.Lock()
+				if kv.rf.CondInstallSnapshot(message.SnapshotTerm,message.SnapshotIndex,message.Snapshot){
+					kv.restoreStateFromSnapshot(message.Snapshot)
+					kv.lastApplied = message.SnapshotIndex
+				}
+				kv.mu.Unlock()
+			}else {
+				panic(fmt.Sprintf("Invalid ApplyMsg %v", message))
 			}
 		}
 	}
+}
+
+// needSnapshot 判断是否需要快照
+func (kv *KVServer) needSnapshot() bool{
+	//设置了raft节点的最大日志并且日志量以及超过了最大日志量
+	return kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() >= kv.maxraftstate
+}
+
+// takeSnapshot 执行快照到日志index
+func (kv *KVServer) takeSnapshot(index int){
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.stateMachine)
+	e.Encode(kv.lastOperations)
+	data := w.Bytes()
+	kv.rf.Snapshot(index,data)
+}
+
+// restoreStateFromSnapshot 从快照中恢复状态机数据
+func (kv *KVServer) restoreStateFromSnapshot(snapshot []byte){
+	if snapshot == nil || len(snapshot) < 1 {
+		return 
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var stateMachine KV_dataset
+	var lastOperations map[int64]OperationContext
+	if d.Decode(&stateMachine) != nil || d.Decode(&lastOperations) != nil{
+		panic("Failed to restore state from snapshot")
+	}
+	kv.stateMachine = &stateMachine
+	kv.lastOperations = lastOperations
 }
 
 // servers[] contains the ports of the set of
@@ -195,6 +242,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		notifyChs:      make(map[int]chan *CommandReply),
 	}
 
+	kv.restoreStateFromSnapshot(persister.ReadSnapshot())
 	//开启服务器的提交协程
 	go kv.appler()
 
