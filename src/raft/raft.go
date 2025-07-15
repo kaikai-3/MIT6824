@@ -232,6 +232,10 @@ func (rf *Raft) GetRaftStateSize() int{
 	return rf.persister.RaftStateSize()
 }
 
+func (rf *Raft) GetId() int {
+	return rf.me
+}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -476,6 +480,14 @@ func (rf *Raft) replicator(peer int) {
 		}
 		rf.replicateOnceRound(peer)
 	}
+}
+
+// HasLogInCurrentTerm 检查当前任期是否有日志条目
+// 如果最后一个日志条目的任期等于当前任期，则返回true
+func (rf *Raft) HasLogInCurrentTerm() bool {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.getLastLog().Term == rf.currentTerm
 }
 
 // the service or tester wants to create a Raft server. the ports
